@@ -43,6 +43,7 @@ pub struct Modules {
     pub input:      InputModule,
     pub sfanalysis: SfAnalysisModule,
     pub cpu:        CpuModule,
+    pub gpu:        GpuModule,
     pub sysfs:      SysfsModule,
     pub sched:      SchedModule,
 }
@@ -117,6 +118,26 @@ pub struct ClusterPowerModel {
     pub plain_freq:    f64,
     /// Lowest-power frequency (GHz)
     pub free_freq:     f64,
+}
+
+
+// gpu
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuModule {
+    pub enable:       bool,
+    /// Min frequency kHz (idle floor)
+    pub min_freq_khz: u64,
+    /// Mid frequency kHz (touch floor)
+    pub mid_freq_khz: u64,
+    /// Max frequency kHz (boost ceiling)
+    pub max_freq_khz: u64,
+}
+
+impl Default for GpuModule {
+    fn default() -> Self {
+        Self { enable: false, min_freq_khz: 200_000, mid_freq_khz: 450_000, max_freq_khz: 1_000_000 }
+    }
 }
 
 // sysfs

@@ -20,6 +20,7 @@ mod sysfs;
 mod cpu;
 mod sched;
 mod watcher;
+mod gpu;
 
 use std::collections::HashMap;
 use std::io;
@@ -37,6 +38,7 @@ use sysfs::SysfsWriter;
 use cpu::{Governor, PowerModel};
 use sched::{TaskScheduler, SchedScene};
 use watcher::{Watcher, WatchEvent};
+use gpu::{GpuGovernor, GpuConfig};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -96,6 +98,17 @@ fn main() -> Result<()> {
 
     let power_model = PowerModel::new(&cfg.modules.cpu, &cfg.modules.sched.cpumask);
     let mut governor = Governor::new(power_model, &cfg.initials.cpu);
+    let gpu_cfg = GpuConfig {
+        min_freq_khz: cfg.modules.gpu.min_freq_khz,
+        mid_freq_khz: cfg.modules.gpu.mid_freq_khz,
+        max_freq_khz: cfg.modules.gpu.max_freq_khz,
+    };
+    let mut gpu_gov = if cfg.modules.gpu.enable {
+        Some(GpuGovernor::new(gpu_cfg))
+    } else {
+        log::info!("GPU governor disabled in config");
+        None
+    };
     let mut scheduler = TaskScheduler::new(cfg.modules.sched.clone());
     let mut fsm = StateMachine::new(cfg.modules.switcher.hint_duration.clone());
 
@@ -146,7 +159,7 @@ fn main() -> Result<()> {
 
         // FSM timeout tick
         if let Some(new_hint) = fsm.tick() {
-            on_hint_change(&mut sysfs, &mut governor, &mut scheduler,
+            on_hint_change(&mut sysfs, &mut governor, &mut gpu_gov, &mut scheduler,
                            &cfg, &current_mode, new_hint);
         }
 
@@ -160,20 +173,17 @@ fn main() -> Result<()> {
                     match we {
                         WatchEvent::AppSwitch => {
                             if let Some(h) = fsm.on_window_switch() {
-                                on_hint_change(&mut sysfs, &mut governor,
-                                               &mut scheduler, &cfg, &current_mode, h);
+                                on_hint_change(&mut sysfs, &mut governor, &mut gpu_gov, &mut scheduler, &cfg, &current_mode, h);
                             }
                         }
                         WatchEvent::ScreenOn => {
                             if let Some(h) = fsm.on_screen_on() {
-                                on_hint_change(&mut sysfs, &mut governor,
-                                               &mut scheduler, &cfg, &current_mode, h);
+                                on_hint_change(&mut sysfs, &mut governor, &mut gpu_gov, &mut scheduler, &cfg, &current_mode, h);
                             }
                         }
                         WatchEvent::ScreenOff => {
                             if let Some(h) = fsm.on_screen_off() {
-                                on_hint_change(&mut sysfs, &mut governor,
-                                               &mut scheduler, &cfg, &current_mode, h);
+                                on_hint_change(&mut sysfs, &mut governor, &mut gpu_gov, &mut scheduler, &cfg, &current_mode, h);
                             }
                         }
                         WatchEvent::ModeChange(mode) => {
@@ -211,8 +221,7 @@ fn main() -> Result<()> {
                         TouchEvent::Gesture => fsm.on_gesture(),
                     };
                     if let Some(h) = new_hint {
-                        on_hint_change(&mut sysfs, &mut governor,
-                                       &mut scheduler, &cfg, &current_mode, h);
+                        on_hint_change(&mut sysfs, &mut governor, &mut gpu_gov, &mut scheduler, &cfg, &current_mode, h);
                     }
                 }
             }
@@ -225,6 +234,7 @@ fn main() -> Result<()> {
 fn on_hint_change(
     sysfs:     &mut SysfsWriter,
     governor:  &mut Governor,
+    gpu_gov:   &mut Option<GpuGovernor>,
     scheduler: &mut TaskScheduler,
     cfg:       &Config,
     mode:      &str,
@@ -232,6 +242,7 @@ fn on_hint_change(
 ) {
     log::debug!("Hint → {:?}", hint);
     apply_preset(sysfs, governor, cfg, mode, hint);
+    if let Some(ref mut g) = gpu_gov { g.apply_hint(hint); }
     let scene = match hint.sched_scene() {
         "boost" => SchedScene::Boost,
         "touch" => SchedScene::Touch,

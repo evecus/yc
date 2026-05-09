@@ -31,6 +31,12 @@
       "enable": false,
       "renderIdleSlackTime": 0.2
     },
+    "gpu": {
+      "enable": true,
+      "minFreqKhz": 220000,
+      "midFreqKhz": 500000,
+      "maxFreqKhz": 1300000
+    },
     "cpu": {
       "enable": true,
       "powerModel": [
