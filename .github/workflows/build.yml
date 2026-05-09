@@ -1,0 +1,64 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'          # 推 tag 时触发，例如 git tag v0.1.0
+  workflow_dispatch:  # 也可以在 Actions 页面手动点 Run
+
+jobs:
+  build-android:
+    name: Build aarch64-linux-android
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c        # 当前最新 LTS，支持 API 21+
+          add-to-path: true
+
+      - name: Configure cargo linker
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << 'EOF'
+          [target.aarch64-linux-android]
+          linker = "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
+          EOF
+
+      - name: Build release binary
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo build --release --target aarch64-linux-android
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p dist
+          cp target/aarch64-linux-android/release/uperf dist/uperf
+          cp -r config dist/config
+          # 打包成 zip，方便直接刷入
+          cd dist && zip -r ../uperf-${{ github.ref_name }}-aarch64.zip .
+
+      - name: Upload artifact (every build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: uperf-aarch64
+          path: dist/uperf
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            uperf-${{ github.ref_name }}-aarch64.zip
+          generate_release_notes: true
