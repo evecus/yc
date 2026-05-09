@@ -51,11 +51,21 @@
           "freeFreq": 0.75
         },
         {
-          "_comment": "c1 \u2014 4\u00d7 Cortex-A715 (big), 3\u00d73.2GHz + 1\u00d73.35GHz, same policy",
-          "efficiency": 320,
-          "nr": 4,
-          "typicalPower": 0.9,
+          "_comment": "c1 \u2014 3\u00d7 Cortex-A715 (mid), up to 3.2 GHz",
+          "efficiency": 310,
+          "nr": 3,
+          "typicalPower": 0.75,
           "typicalFreq": 1.8,
+          "sweetFreq": 2.4,
+          "plainFreq": 2.9,
+          "freeFreq": 1.0
+        },
+        {
+          "_comment": "c2 \u2014 1\u00d7 Cortex-A715 (prime), up to 3.35 GHz",
+          "efficiency": 340,
+          "nr": 1,
+          "typicalPower": 1.2,
+          "typicalFreq": 2.0,
           "sweetFreq": 2.6,
           "plainFreq": 3.0,
           "freeFreq": 1.0
@@ -72,8 +82,10 @@
         "cpusetRe": "/dev/cpuset/restricted/cpus",
         "c0MaxFreq": "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
         "c1MaxFreq": "/sys/devices/system/cpu/cpu4/cpufreq/scaling_max_freq",
+        "c2MaxFreq": "/sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq",
         "c0MinFreq": "/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq",
         "c1MinFreq": "/sys/devices/system/cpu/cpu4/cpufreq/scaling_min_freq",
+        "c2MinFreq": "/sys/devices/system/cpu/cpu7/cpufreq/scaling_min_freq",
         "cpuSchedBoost": "/proc/sys/kernel/sched_boost",
         "mtSchedUtil": "/sys/devices/system/cpu/cpu0/cpufreq/schedutil/rate_limit_us"
       }
@@ -100,7 +112,9 @@
         "c1": [
           4,
           5,
-          6,
+          6
+        ],
+        "c2": [
           7
         ]
       },
@@ -151,7 +165,7 @@
           "bg": "",
           "fg": "all",
           "idle": "all",
-          "touch": "c1",
+          "touch": "c2",
           "boost": "all"
         }
       },
@@ -424,7 +438,8 @@
         "cpu.fastLimitCapacity": 4.0,
         "cpu.margin": 0.1,
         "c0MaxFreq": "1600000",
-        "c1MaxFreq": "2000000"
+        "c1MaxFreq": "2000000",
+        "c2MaxFreq": "2000000"
       },
       "idle": {
         "cpu.baseSampleTime": 0.04,
@@ -434,7 +449,8 @@
         "sched.scene": "idle",
         "cpusetTa": "0-6",
         "c0MaxFreq": "1200000",
-        "c1MaxFreq": "1500000"
+        "c1MaxFreq": "1500000",
+        "c2MaxFreq": "1500000"
       },
       "touch": {
         "cpu.baseSampleTime": 0.04,
@@ -462,7 +478,8 @@
         "cpu.margin": 0.3,
         "sched.scene": "boost",
         "c0MaxFreq": "2200000",
-        "c1MaxFreq": "2800000"
+        "c1MaxFreq": "2800000",
+        "c2MaxFreq": "2800000"
       }
     },
     "balance": {
@@ -481,7 +498,8 @@
         "sched.scene": "idle",
         "cpusetTa": "0-6",
         "c0MaxFreq": "1600000",
-        "c1MaxFreq": "2000000"
+        "c1MaxFreq": "2000000",
+        "c2MaxFreq": "2000000"
       },
       "touch": {
         "cpu.baseSampleTime": 0.04,
@@ -509,7 +527,8 @@
         "cpu.margin": 0.4,
         "sched.scene": "boost",
         "c0MaxFreq": "2200000",
-        "c1MaxFreq": "3200000"
+        "c1MaxFreq": "3200000",
+        "c2MaxFreq": "3200000"
       }
     },
     "performance": {
@@ -532,7 +551,8 @@
       "trigger": {
         "cpu.margin": 0.8,
         "sched.scene": "touch",
-        "c1MaxFreq": "3350000"
+        "c1MaxFreq": "3350000",
+        "c2MaxFreq": "3350000"
       },
       "gesture": {
         "cpu.margin": 0.8,
@@ -546,7 +566,8 @@
         "cpu.burst": 0.2,
         "sched.scene": "boost",
         "c0MaxFreq": "2200000",
-        "c1MaxFreq": "3350000"
+        "c1MaxFreq": "3200000",
+        "c2MaxFreq": "3350000"
       }
     },
     "fast": {
@@ -557,7 +578,8 @@
         "cpu.fastLimitCapacity": 0.0,
         "cpu.margin": 0.4,
         "c0MaxFreq": "2200000",
-        "c1MaxFreq": "3350000"
+        "c1MaxFreq": "3200000",
+        "c2MaxFreq": "3350000"
       },
       "idle": {
         "cpu.baseSampleTime": 0.01,
