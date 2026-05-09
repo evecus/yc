@@ -3,12 +3,12 @@ name: Build
 on:
   push:
     tags:
-      - 'v*'          # 推 tag 时触发，例如 git tag v0.1.0
-  workflow_dispatch:  # 也可以在 Actions 页面手动点 Run
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build-android:
-    name: Build aarch64-linux-android
+    name: Build & Package
     runs-on: ubuntu-latest
 
     steps:
@@ -24,15 +24,15 @@ jobs:
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r27c        # 当前最新 LTS，支持 API 21+
+          ndk-version: r27c
           add-to-path: true
 
       - name: Configure cargo linker
         run: |
           mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'EOF'
+          cat >> ~/.cargo/config.toml << EOF
           [target.aarch64-linux-android]
-          linker = "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
+          linker = "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
           EOF
 
       - name: Build release binary
@@ -41,24 +41,49 @@ jobs:
         run: |
           cargo build --release --target aarch64-linux-android
 
-      - name: Prepare release assets
+      - name: Determine version
+        id: version
         run: |
-          mkdir -p dist
-          cp target/aarch64-linux-android/release/uperf dist/uperf
-          cp -r config dist/config
-          # 打包成 zip，方便直接刷入
-          cd dist && zip -r ../uperf-${{ github.ref_name }}-aarch64.zip .
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "ver=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "ver=dev-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Upload artifact (every build)
+      - name: Package flashable zip
+        run: |
+          VER="${{ steps.version.outputs.ver }}"
+          ZIPNAME="uperf-${VER}.zip"
+
+          cp -r module pkg
+
+          mkdir -p pkg/bin
+          cp target/aarch64-linux-android/release/uperf pkg/bin/uperf
+
+          mkdir -p pkg/config
+          cp config/*.json pkg/config/
+
+          sed -i "s/^version=.*/version=${VER}/" pkg/module.prop
+          sed -i "s/^versionCode=.*/versionCode=$(date +%Y%m%d)/" pkg/module.prop
+
+          cd pkg
+          zip -r9 "../${ZIPNAME}" . --exclude "*.placeholder"
+          # 二进制用 store 模式（安装时不需要解压缩，节省时间）
+          zip -r0 "../${ZIPNAME}" bin/uperf
+          cd ..
+
+          echo "ZIPNAME=${ZIPNAME}" >> $GITHUB_ENV
+          ls -lh "${ZIPNAME}"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: uperf-aarch64
-          path: dist/uperf
+          name: uperf-zip
+          path: ${{ env.ZIPNAME }}
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            uperf-${{ github.ref_name }}-aarch64.zip
+          files: ${{ env.ZIPNAME }}
           generate_release_notes: true
