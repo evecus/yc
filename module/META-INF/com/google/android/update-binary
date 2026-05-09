@@ -72,39 +72,44 @@ unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >/dev/null 2>&1 \
     || abort "Failed to extract zip"
 
 # ── 平台检测 → 选择配置文件 ──────────────────────────────────────────────────
-BOARD="$(getprop ro.product.board)"
-[ -z "$BOARD" ] && BOARD="$(getprop ro.board.platform)"
+# 优先用 ro.board.platform（联发科 SoC 代号，如 mt6897），
+# ro.product.board 是厂商自定义字符串（如 P98300DA2），不可靠
+PLATFORM="$(getprop ro.board.platform 2>/dev/null)"
+BOARD="$(getprop ro.product.board 2>/dev/null)"
 
-ui_print "- Board: $BOARD"
+ui_print "- Platform: $PLATFORM  Board: $BOARD"
+
+# 通过 CPU7 最高频率区分 9400 和 9400+
+detect_9400_variant() {
+    MAX_FREQ_7="$(cat /sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq 2>/dev/null)"
+    if [ -n "$MAX_FREQ_7" ] && [ "$MAX_FREQ_7" -ge 3700000 ] 2>/dev/null; then
+        echo "mtd9400p"
+    else
+        echo "mtd9400"
+    fi
+}
 
 select_config() {
     case "$1" in
-        mt6897|mt6897*)  echo "mtd8300u" ;;  # Dimensity 8300-Ultra
-        mt6896|mt6896*)  echo "mtd8300"  ;;  # Dimensity 8300
-        mt6991|mt6991*)  echo "mtd9400"  ;;  # Dimensity 9400
-        # 9400+ 目前没有独立 board name，通过最高频率区分
-        *)
-            # 尝试从 CPU 最高频率推断 9400 vs 9400+
-            MAX_FREQ_7="$(cat /sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq 2>/dev/null)"
-            if [ -n "$MAX_FREQ_7" ] && [ "$MAX_FREQ_7" -ge 3700000 ] 2>/dev/null; then
-                echo "mtd9400p"
-            else
-                echo "unsupported"
-            fi
-            ;;
+        mt6897) echo "mtd8300u" ;;   # Dimensity 8300-Ultra
+        mt6896) echo "mtd8300"  ;;   # Dimensity 8300
+        mt6991) echo "$(detect_9400_variant)" ;;  # Dimensity 9400 / 9400+
+        *)      echo "unsupported" ;;
     esac
 }
 
-CONFIG_NAME="$(select_config $BOARD)"
+# 先用 platform name 匹配，匹配不到再试 board name 最后8字符前缀
+CONFIG_NAME="$(select_config $PLATFORM)"
+if [ "$CONFIG_NAME" = "unsupported" ]; then
+    CONFIG_NAME="$(select_config $BOARD)"
+fi
 
 USER_CFG_DIR="/sdcard/Android/yc/uperf"
 mkdir -p "$USER_CFG_DIR"
 
 if [ "$CONFIG_NAME" = "unsupported" ]; then
-    ui_print "! Platform $BOARD not recognized"
-    ui_print "! Please manually copy a config from $MODPATH/config/ to:"
-    ui_print "!   $USER_CFG_DIR/platform.json"
-    # 还是继续安装，用户之后手动配置
+    ui_print "! Platform not recognized (platform=$PLATFORM board=$BOARD)"
+    ui_print "! Defaulting to mtd9400 — you may need to manually set the config"
     CONFIG_NAME="mtd9400"
 fi
 
@@ -128,6 +133,8 @@ set_perm_recursive() {
 
 set_perm_recursive "$MODPATH"          root root 0755 0644
 chmod 0755 "$MODPATH/bin/uperf"
+# KernelSU 在某些设备上模块目录挂为 noexec，用 chcon 设置可执行上下文
+chcon "u:object_r:system_file:s0" "$MODPATH/bin/uperf" 2>/dev/null
 chmod 0755 "$MODPATH/service.sh"
 chmod 0755 "$MODPATH/post-fs-data.sh"
 [ -f "$MODPATH/uninstall.sh" ] && chmod 0755 "$MODPATH/uninstall.sh"
