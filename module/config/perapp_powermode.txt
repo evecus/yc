@@ -1,0 +1,6 @@
+# Per-app performance mode overrides
+# Format: <package_name> <mode>
+# Example:
+#   com.tencent.tmgp.pubgmhd performance
+#   com.miHoYo.GenshinImpact  performance
+#   com.android.chrome         balance

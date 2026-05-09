@@ -1,0 +1,139 @@
+#!/sbin/sh
+# update-binary — universal installer
+# Supports: Magisk ≥ 20.4, KernelSU, APatch
+# Must use /sbin/sh shebang for recovery compatibility
+
+SKIPUNZIP=1
+
+# ── 统一打印函数 ──────────────────────────────────────────────────────────────
+ui_print() {
+    if [ -n "$OUTFD" ]; then
+        echo "ui_print $1" >> /proc/self/fd/$OUTFD
+        echo "ui_print"    >> /proc/self/fd/$OUTFD
+    else
+        echo "$1"
+    fi
+}
+
+abort() {
+    ui_print "ERROR: $1"
+    exit 1
+}
+
+# ── 环境检测 ─────────────────────────────────────────────────────────────────
+OUTFD=$2
+ZIPFILE=$3
+
+# KernelSU / APatch 通过 KSUD_VERSION / APATCH_VERSION 标识自己
+# Magisk 通过 MAGISK_VER_CODE
+if [ -n "$KSU" ] || [ -n "$APATCH" ]; then
+    ROOT_IMPL="ksu_apatch"
+elif [ -n "$MAGISK_VER_CODE" ]; then
+    ROOT_IMPL="magisk"
+else
+    # 尝试从已安装的工具检测
+    if [ -f /data/adb/ksu/bin/ksud ]; then
+        ROOT_IMPL="ksu_apatch"
+    elif [ -f /data/adb/magisk/magisk ]; then
+        ROOT_IMPL="magisk"
+    else
+        ROOT_IMPL="unknown"
+    fi
+fi
+
+ui_print "- Detected root: $ROOT_IMPL"
+
+# ── 架构检查 ─────────────────────────────────────────────────────────────────
+ABI="$(getprop ro.product.cpu.abi)"
+[ "$ABI" = "arm64-v8a" ] || abort "Only arm64 is supported (got $ABI)"
+
+# ── 模块安装路径 ─────────────────────────────────────────────────────────────
+MODID="uperf"
+case "$ROOT_IMPL" in
+    magisk)
+        MODPATH="/data/adb/modules_update/$MODID"
+        ;;
+    ksu_apatch)
+        MODPATH="/data/adb/modules/$MODID"
+        ;;
+    *)
+        # fallback: 尝试 Magisk 路径
+        MODPATH="/data/adb/modules_update/$MODID"
+        ;;
+esac
+
+ui_print "- Installing to: $MODPATH"
+rm -rf "$MODPATH"
+mkdir -p "$MODPATH"
+
+# ── 解压模块文件 ─────────────────────────────────────────────────────────────
+ui_print "- Extracting files"
+unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >/dev/null 2>&1 \
+    || abort "Failed to extract zip"
+
+# ── 平台检测 → 选择配置文件 ──────────────────────────────────────────────────
+BOARD="$(getprop ro.product.board)"
+[ -z "$BOARD" ] && BOARD="$(getprop ro.board.platform)"
+
+ui_print "- Board: $BOARD"
+
+select_config() {
+    case "$1" in
+        mt6897|mt6897*)  echo "mtd8300u" ;;  # Dimensity 8300-Ultra
+        mt6896|mt6896*)  echo "mtd8300"  ;;  # Dimensity 8300
+        mt6991|mt6991*)  echo "mtd9400"  ;;  # Dimensity 9400
+        # 9400+ 目前没有独立 board name，通过最高频率区分
+        *)
+            # 尝试从 CPU 最高频率推断 9400 vs 9400+
+            MAX_FREQ_7="$(cat /sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq 2>/dev/null)"
+            if [ -n "$MAX_FREQ_7" ] && [ "$MAX_FREQ_7" -ge 3700000 ] 2>/dev/null; then
+                echo "mtd9400p"
+            else
+                echo "unsupported"
+            fi
+            ;;
+    esac
+}
+
+CONFIG_NAME="$(select_config $BOARD)"
+
+USER_CFG_DIR="/sdcard/Android/yc/uperf"
+mkdir -p "$USER_CFG_DIR"
+
+if [ "$CONFIG_NAME" = "unsupported" ]; then
+    ui_print "! Platform $BOARD not recognized"
+    ui_print "! Please manually copy a config from $MODPATH/config/ to:"
+    ui_print "!   $USER_CFG_DIR/platform.json"
+    # 还是继续安装，用户之后手动配置
+    CONFIG_NAME="mtd9400"
+fi
+
+ui_print "- Config: $CONFIG_NAME"
+
+# 把平台配置复制为运行时配置
+cp -f "$MODPATH/config/${CONFIG_NAME}.json" "$MODPATH/config/platform.json" \
+    || abort "Config file ${CONFIG_NAME}.json not found"
+
+# 把默认模式文件写到 sdcard（如果不存在）
+[ -f "$USER_CFG_DIR/cur_powermode.txt" ] || echo "balance" > "$USER_CFG_DIR/cur_powermode.txt"
+[ -f "$USER_CFG_DIR/perapp_powermode.txt" ] || touch "$USER_CFG_DIR/perapp_powermode.txt"
+
+# ── 权限设置 ─────────────────────────────────────────────────────────────────
+ui_print "- Setting permissions"
+set_perm_recursive() {
+    chown -R "$2:$3" "$1"
+    find "$1" -type d -exec chmod "$4" {} \;
+    find "$1" -type f -exec chmod "$5" {} \;
+}
+
+set_perm_recursive "$MODPATH"          root root 0755 0644
+chmod 0755 "$MODPATH/bin/uperf"
+chmod 0755 "$MODPATH/service.sh"
+chmod 0755 "$MODPATH/post-fs-data.sh"
+[ -f "$MODPATH/uninstall.sh" ] && chmod 0755 "$MODPATH/uninstall.sh"
+
+# ── 完成 ─────────────────────────────────────────────────────────────────────
+ui_print "- Done!"
+ui_print "  Reboot to activate uperf."
+ui_print "  Mode file: $USER_CFG_DIR/cur_powermode.txt"
+ui_print "  Values: powersave / balance / performance / fast"

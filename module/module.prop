@@ -1,0 +1,7 @@
+id=uperf
+name=uperf
+version=v0.1.0
+versionCode=1
+author=community
+description=Userspace performance controller — Rust rewrite, supports Dimensity 8300/9400
+minMagisk=20400
