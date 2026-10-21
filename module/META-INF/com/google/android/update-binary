@@ -1,0 +1,173 @@
+#!/sbin/sh
+# update-binary — universal installer
+# Supports: Magisk ≥ 20.4, KernelSU, APatch
+# Must use /sbin/sh shebang for recovery compatibility
+
+SKIPUNZIP=1
+
+# ── 统一打印函数 ──────────────────────────────────────────────────────────────
+ui_print() {
+    if [ -n "$OUTFD" ]; then
+        echo "ui_print $1" >> /proc/self/fd/$OUTFD
+        echo "ui_print"    >> /proc/self/fd/$OUTFD
+    else
+        echo "$1"
+    fi
+}
+
+abort() {
+    ui_print "ERROR: $1"
+    exit 1
+}
+
+# ── 环境检测 ─────────────────────────────────────────────────────────────────
+OUTFD=$2
+ZIPFILE=$3
+
+# KernelSU / APatch 通过 KSUD_VERSION / APATCH_VERSION 标识自己
+# Magisk 通过 MAGISK_VER_CODE
+if [ -n "$KSU" ] || [ -n "$APATCH" ]; then
+    ROOT_IMPL="ksu_apatch"
+elif [ -n "$MAGISK_VER_CODE" ]; then
+    ROOT_IMPL="magisk"
+else
+    # 尝试从已安装的工具检测
+    if [ -f /data/adb/ksu/bin/ksud ]; then
+        ROOT_IMPL="ksu_apatch"
+    elif [ -f /data/adb/magisk/magisk ]; then
+        ROOT_IMPL="magisk"
+    else
+        ROOT_IMPL="unknown"
+    fi
+fi
+
+ui_print "- Detected root: $ROOT_IMPL"
+
+# ── 架构检查 ─────────────────────────────────────────────────────────────────
+ABI="$(getprop ro.product.cpu.abi)"
+[ "$ABI" = "arm64-v8a" ] || abort "Only arm64 is supported (got $ABI)"
+
+# ── 模块安装路径 ─────────────────────────────────────────────────────────────
+MODID="uperf"
+case "$ROOT_IMPL" in
+    magisk)
+        MODPATH="/data/adb/modules_update/$MODID"
+        ;;
+    ksu_apatch)
+        MODPATH="/data/adb/modules/$MODID"
+        ;;
+    *)
+        # fallback: 尝试 Magisk 路径
+        MODPATH="/data/adb/modules_update/$MODID"
+        ;;
+esac
+
+ui_print "- Installing to: $MODPATH"
+rm -rf "$MODPATH"
+mkdir -p "$MODPATH"
+
+# ── 解压模块文件 ─────────────────────────────────────────────────────────────
+ui_print "- Extracting files"
+unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >/dev/null 2>&1 \
+    || abort "Failed to extract zip"
+
+# ── 平台检测 → 选择配置文件 ──────────────────────────────────────────────────
+# 优先用 ro.board.platform（SoC 代号：联发科 mt6897 / 骁龙 taro、kalama、pineapple），
+# ro.product.board 是厂商自定义字符串（如 P98300DA2），不可靠
+PLATFORM="$(getprop ro.board.platform 2>/dev/null)"
+BOARD="$(getprop ro.product.board 2>/dev/null)"
+
+ui_print "- Platform: $PLATFORM  Board: $BOARD"
+
+# 通过 CPU7 最高频率区分 9400 和 9400+
+detect_9400_variant() {
+    MAX_FREQ_7="$(cat /sys/devices/system/cpu/cpu7/cpufreq/cpuinfo_max_freq 2>/dev/null)"
+    if [ -n "$MAX_FREQ_7" ] && [ "$MAX_FREQ_7" -ge 3700000 ] 2>/dev/null; then
+        echo "mtd9400p"
+    else
+        echo "mtd9400"
+    fi
+}
+
+select_config() {
+    case "$1" in
+        mt6897) echo "mtd8300u" ;;   # Dimensity 8300-Ultra
+        mt6896) echo "mtd8300"  ;;   # Dimensity 8300
+        mt6983) echo "mtd9000"  ;;   # Dimensity 9000 / 9000+
+        mt6985) echo "mtd9200"  ;;   # Dimensity 9200 / 9200+
+        mt6989) echo "mtd9300"  ;;   # Dimensity 9300 / 9300+
+        mt6991) echo "$(detect_9400_variant)" ;;  # Dimensity 9400 / 9400+
+        mt6993) echo "mtd9500"  ;;   # Dimensity 9500
+        taro)      echo "sd8gen1p" ;;  # Snapdragon 8+ Gen 1 (8 Gen 1 同平台，复用)
+        kalama)    echo "sd8gen2"  ;;  # Snapdragon 8 Gen 2
+        pineapple) echo "sd8gen3"  ;;  # Snapdragon 8 Gen 3
+        sun)       echo "sd8elite" ;; # Snapdragon 8 Elite (SM8750)
+        kaanapali) echo "sd8elite2" ;; # Snapdragon 8 Elite Gen 2 (SM8850)
+        cliffs)    echo "sd8sgen3" ;;  # Snapdragon 8s Gen 3 (SM8635)
+        cliffs7)   echo "sd8sgen3" ;;  # Snapdragon 7+ Gen 3 (SM7675)，同架构降频，复用
+        *)      echo "unsupported" ;;
+    esac
+}
+
+# 先用 platform name 匹配，匹配不到再试 board name 最后8字符前缀
+CONFIG_NAME="$(select_config $PLATFORM)"
+if [ "$CONFIG_NAME" = "unsupported" ]; then
+    CONFIG_NAME="$(select_config $BOARD)"
+fi
+
+USER_CFG_DIR="/sdcard/Android/yc/uperf"
+mkdir -p "$USER_CFG_DIR"
+
+# 平台未识别 → 写入 auto 标记，由 uperf 运行时自动探测拓扑/频率/GPU
+write_auto_config() {
+    printf '{"meta":{"name":"auto","author":"uperf-rs"}}' \
+        > "$MODPATH/config/platform.json" 2>/dev/null
+}
+
+if [ "$CONFIG_NAME" = "unsupported" ]; then
+    ui_print "! Platform not recognized (platform=$PLATFORM board=$BOARD)"
+    ui_print "! Falling back to runtime auto-detection (topology/freqs/GPU probed at boot)"
+    write_auto_config
+else
+    # 已知平台但配置文件缺失（精简版 zip）→ 同样走 auto
+    if [ ! -f "$MODPATH/config/${CONFIG_NAME}.json" ]; then
+        ui_print "! Config ${CONFIG_NAME}.json missing in module — using auto-detection"
+        write_auto_config
+    else
+        cp -f "$MODPATH/config/${CONFIG_NAME}.json" "$MODPATH/config/platform.json" \
+            || { ui_print "! Config copy failed — using auto-detection"; write_auto_config; }
+    fi
+fi
+
+[ -f "$MODPATH/config/platform.json" ] || abort "Failed to prepare platform.json"
+
+ui_print "- Config: $CONFIG_NAME"
+
+# 把默认模式文件写到 sdcard（如果不存在）
+[ -f "$USER_CFG_DIR/cur_powermode.txt" ] || echo "balance" > "$USER_CFG_DIR/cur_powermode.txt"
+[ -f "$USER_CFG_DIR/perapp_powermode.txt" ] || touch "$USER_CFG_DIR/perapp_powermode.txt"
+
+# ── 权限设置 ─────────────────────────────────────────────────────────────────
+ui_print "- Setting permissions"
+set_perm_recursive() {
+    chown -R "$2:$3" "$1"
+    find "$1" -type d -exec chmod "$4" {} \;
+    find "$1" -type f -exec chmod "$5" {} \;
+}
+
+set_perm_recursive "$MODPATH"          root root 0755 0644
+chmod 0755 "$MODPATH/bin/uperf"
+# KernelSU 在某些设备上模块目录挂为 noexec，用 chcon 设置可执行上下文
+chcon "u:object_r:system_file:s0" "$MODPATH/bin/uperf" 2>/dev/null
+# eBPF 内核态目标文件是数据文件（uperf 启动时读取加载，无需执行权限），
+# 同样打上 system_file 上下文避免 SELinux 读取被拒
+[ -f "$MODPATH/bin/uperf-ebpf" ] && chcon "u:object_r:system_file:s0" "$MODPATH/bin/uperf-ebpf" 2>/dev/null
+chmod 0755 "$MODPATH/service.sh"
+chmod 0755 "$MODPATH/post-fs-data.sh"
+[ -f "$MODPATH/uninstall.sh" ] && chmod 0755 "$MODPATH/uninstall.sh"
+
+# ── 完成 ─────────────────────────────────────────────────────────────────────
+ui_print "- Done!"
+ui_print "  Reboot to activate uperf."
+ui_print "  Mode file: $USER_CFG_DIR/cur_powermode.txt"
+ui_print "  Values: powersave / balance / performance / fast"

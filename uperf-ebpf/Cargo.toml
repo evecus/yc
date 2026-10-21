@@ -1,0 +1,23 @@
+[package]
+name = "uperf-ebpf"
+version = "0.1.0"
+edition = "2021"
+description = "uperf eBPF kernel side — process lifecycle tracepoints feeding the userspace TaskScheduler"
+
+[[bin]]
+name = "uperf-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.2"
+
+# NOTE: opt-level must NOT be "s"/"z" — bpf-linker >=0.12 rejects -Os/-Oz.
+# Use O2 plus #[inline] on hot paths instead.
+[profile.release]
+opt-level = 2
+lto = true
+debug = false
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
