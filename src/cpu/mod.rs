@@ -13,8 +13,9 @@
 //
 // Here we implement:
 //   1. ClusterGovernor: samples top-app cgroup utilisation (cgroup v1
-//      cpuacct per-cpu, global /proc/stat fallback), computes the target
-//      frequency from the piecewise energy model, writes scaling_max_freq.
+//      cpuacct per-cpu, cgroup v2 cpu.stat aggregate, global /proc/stat
+//      fallback), computes the target frequency from the piecewise energy
+//      model, writes scaling_max_freq.
 //   2. PowerModel: the per-cluster energy model arithmetic.
 //
 // Optimizations vs the first rewrite:
@@ -181,10 +182,21 @@ struct CpuStat {
 
 /// Utilisation source preference:
 ///   1. cgroup v1 cpuacct of top-app (per-cpu usage, foreground only)
-///   2. global /proc/stat (fallback; forced to zero when screen off)
+///      — probed at both the unified and the classic Android mount
+///   2. cgroup v2 top-app `cpu.stat` usage_usec (aggregate, foreground only)
+///   3. global /proc/stat (last resort; forced to zero when screen off)
+enum UtilSource {
+    /// per-cpu cumulative ns (v1 cpuacct.usage_percpu)
+    V1Percpu(PathBuf),
+    /// aggregate cumulative µs (v2 cpu.stat usage_usec)
+    V2Aggregate(PathBuf),
+    ProcStat,
+}
+
 pub struct UtilSampler {
-    v1_path:   Option<PathBuf>,
+    source:    UtilSource,
     prev_cg:   Vec<u64>,        // v1 per-cpu cumulative ns
+    prev_v2:   Option<u64>,     // v2 aggregate cumulative µs
     prev_proc: Vec<CpuStat>,    // global fallback
     last_t:    Instant,
     inited:    bool,
@@ -192,15 +204,42 @@ pub struct UtilSampler {
 
 impl UtilSampler {
     pub fn new() -> Self {
-        let v1 = PathBuf::from("/sys/fs/cgroup/cpuacct/top-app/cpuacct.usage_percpu");
-        let v1_path = if v1.exists() { Some(v1) } else { None };
-        match &v1_path {
-            Some(p) => log::info!("util: sampling top-app cgroup v1 ({})", p.display()),
-            None    => log::info!("util: cgroup v1 cpuacct unavailable, falling back to /proc/stat"),
-        }
+        // v1: unified hierarchy first, then the classic Android /dev/cpuctl
+        // layout (MediaTek / older vendors keep cpuacct there).
+        let v1_path = [
+            "/sys/fs/cgroup/cpuacct/top-app/cpuacct.usage_percpu",
+            "/dev/cpuctl/top-app/cpuacct.usage_percpu",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists());
+
+        let source = if let Some(p) = v1_path {
+            log::info!("util: sampling top-app cgroup v1 per-cpu ({})", p.display());
+            UtilSource::V1Percpu(p)
+        } else {
+            // v2: cpu.stat usage_usec is aggregate (no per-cpu breakdown),
+            // broadcast to all clusters — coarse but still foreground-only.
+            let v2_path = [
+                "/sys/fs/cgroup/top-app/cpu.stat",
+                "/sys/fs/cgroup/unified/top-app/cpu.stat",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+            if let Some(p) = v2_path {
+                log::info!("util: sampling top-app cgroup v2 aggregate ({})", p.display());
+                UtilSource::V2Aggregate(p)
+            } else {
+                log::info!("util: no top-app cgroup cpu accounting, falling back to /proc/stat");
+                UtilSource::ProcStat
+            }
+        };
+
         Self {
-            v1_path,
+            source,
             prev_cg: Vec::new(),
+            prev_v2: None,
             prev_proc: Vec::new(),
             last_t: Instant::now(),
             inited: false,
@@ -218,11 +257,12 @@ impl UtilSampler {
         if front_empty {
             // Reset baseline so the next sample after screen-on is clean
             self.inited = false;
+            self.prev_v2 = None;
             return vec![0.0; n];
         }
 
         // ── cgroup v1: foreground per-cpu usage ──
-        if let Some(path) = &self.v1_path {
+        if let UtilSource::V1Percpu(path) = &self.source {
             if let Ok(raw) = fs::read_to_string(path) {
                 let usage: Vec<u64> = raw
                     .split_whitespace()
@@ -254,6 +294,33 @@ impl UtilSampler {
                             (sum / cpus.len() as f64).clamp(0.0, 1.0)
                         })
                         .collect();
+                }
+            }
+        }
+
+        // ── cgroup v2: foreground aggregate usage, broadcast to all clusters ──
+        if let UtilSource::V2Aggregate(path) = &self.source {
+            if let Ok(raw) = fs::read_to_string(path) {
+                let usage: Option<u64> = raw
+                    .lines()
+                    .find_map(|l| l.strip_prefix("usage_usec ").and_then(|v| v.trim().parse().ok()));
+                if let Some(usage) = usage {
+                    let prev = self.prev_v2.replace(usage);
+                    let Some(prev) = prev else {
+                        self.inited = true;
+                        return vec![0.5; n];
+                    };
+                    if !self.inited || dt_ns <= 0.0 {
+                        return vec![0.5; n];
+                    }
+                    let delta_ns = usage.saturating_sub(prev) as f64 * 1000.0;
+                    let total_cpus: usize = clusters.iter().map(|c| c.len()).sum();
+                    let util = if total_cpus == 0 {
+                        0.0
+                    } else {
+                        (delta_ns / (dt_ns * total_cpus as f64)).clamp(0.0, 1.0)
+                    };
+                    return vec![util; n];
                 }
             }
         }
