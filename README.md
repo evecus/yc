@@ -12,7 +12,37 @@ config format.
 | Android support | Tested path for Android 13–15 (cgroup v2 fallback) |
 | Root frameworks | KernelSU / APatch compatible (no Magisk hard-dependency) |
 | SfAnalysis | Removed — field kept in config for compatibility but ignored |
-| Configs | Dimensity 8300/9400 (`mtd*.json`) and Snapdragon 8+ Gen 1 / 8 Gen 2 / 8 Gen 3 (`sd8gen1p.json`, `sd8gen2.json`, `sd8gen3.json`) |
+| Configs | Dimensity 8300/9400 (`mtd*.json`) and Snapdragon 8+ Gen 1 / 8 Gen 2 / 8 Gen 3 (`sd8gen1p.json`, `sd8gen2.json`, `sd8gen3.json`), plus `auto` runtime detection for unknown SoCs |
+| TaskScheduler | **eBPF event-driven mode** (optional, see below) — fork/exec/rename/exit tracepoints replace the 200 ms /proc poll for new-thread latency |
+| Platform coverage | 8 additional SoC configs (Dimensity 9000/9200/9300/9500, Snapdragon 8 Elite / 8 Elite Gen 2 / 8s Gen 3 / 8s Gen 4); unknown platforms auto-detect topology at boot |
+| util sampling | Foreground cgroup accounting instead of global `/proc/stat` (well-known v1/v2 paths, then a generic scan of every cgroup mount in `/proc/mounts` for OEM-remounted hierarchies, then `/proc/stat` fallback) |
+| Frequency control | Segmented power model (free/sweet/plain/turbo) + write hysteresis |
+| Scheduler overhead | Lazy cmdline reads (pid-cache hits skip /proc), read-before-write action application (affinity/nice/RT skipped when already in the target state), and an eBPF-mode comm cache fed by rename/exit events — the 200 ms fallback poll no longer costs ~20% of a core on MTK procfs |
+
+## eBPF mode (optional)
+
+When the kernel has BTF (`/sys/kernel/btf/vmlinux`) and the module ships
+`bin/uperf-ebpf`, uperf attaches four scheduler tracepoints
+(`sched_process_fork/exec/exit`, `task_rename`) and applies thread rules
+within microseconds of a thread appearing. All policy stays in userspace;
+the kernel side only filters (whitelist + tracked-parent propagation) and
+reports events over a RingBuf.
+
+Any failure — no BTF, missing object, attach error — silently falls back
+to the classic 200 ms /proc scan. Force-disable with `UPERF_NO_EBPF=1`.
+
+The fallback scan itself is cheap: cmdline is only read for pids not yet
+in the pid→rule cache, writes are skipped when the current affinity/nice/RT
+state already matches the target, and in eBPF mode thread names come from
+the rename/exit event stream instead of per-thread /proc reads.
+
+Building the kernel object (needs nightly + bpf-linker):
+
+```bash
+./build-ebpf.sh     # builds uperf-ebpf and copies it into module/bin/
+```
+
+See `build-ebpf.sh` header comments for toolchain setup notes.
 
 ## Architecture
 
@@ -20,7 +50,8 @@ config format.
 epoll loop
   ├── inotify fd  ──→  WatchEvent  (app switch / screen / mode file)
   ├── input fds   ──→  TouchEvent  (/dev/input/event*)
-  └── timerfd     ──→  sample tick (40 ms)
+  ├── timerfd     ──→  sample tick (40 ms)
+  └── ebpf ringbuf ─→ ProcEvent   (fork/exec/rename/exit, optional)
            │
            ▼
       FSM (idle/touch/trigger/gesture/switch/junk)
@@ -28,7 +59,7 @@ epoll loop
     ┌──────┼──────────┐
     ▼      ▼          ▼
  SysfsWriter  Governor  TaskScheduler
- (knobs)    (cpufreq)  (affinity/prio)
+ (knobs)    (cpufreq)  (affinity/prio, eBPF-accelerated)
 ```
 
 ## Cross-compiling for aarch64 Android
@@ -61,7 +92,8 @@ module/
 ├── META-INF/com/google/android/updater-script
 ├── module.prop
 ├── bin/
-│   └── uperf                                   ← compiled binary
+│   ├── uperf                                   ← compiled binary
+│   └── uperf-ebpf                              ← eBPF object (optional; see "eBPF mode")
 ├── config/
 │   ├── mtd9400.json
 │   └── mtd9400p.json

@@ -204,38 +204,7 @@ pub struct UtilSampler {
 
 impl UtilSampler {
     pub fn new() -> Self {
-        // v1: unified hierarchy first, then the classic Android /dev/cpuctl
-        // layout (MediaTek / older vendors keep cpuacct there).
-        let v1_path = [
-            "/sys/fs/cgroup/cpuacct/top-app/cpuacct.usage_percpu",
-            "/dev/cpuctl/top-app/cpuacct.usage_percpu",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.exists());
-
-        let source = if let Some(p) = v1_path {
-            log::info!("util: sampling top-app cgroup v1 per-cpu ({})", p.display());
-            UtilSource::V1Percpu(p)
-        } else {
-            // v2: cpu.stat usage_usec is aggregate (no per-cpu breakdown),
-            // broadcast to all clusters — coarse but still foreground-only.
-            let v2_path = [
-                "/sys/fs/cgroup/top-app/cpu.stat",
-                "/sys/fs/cgroup/unified/top-app/cpu.stat",
-            ]
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|p| p.exists());
-            if let Some(p) = v2_path {
-                log::info!("util: sampling top-app cgroup v2 aggregate ({})", p.display());
-                UtilSource::V2Aggregate(p)
-            } else {
-                log::info!("util: no top-app cgroup cpu accounting, falling back to /proc/stat");
-                UtilSource::ProcStat
-            }
-        };
-
+        let source = Self::probe_source();
         Self {
             source,
             prev_cg: Vec::new(),
@@ -244,6 +213,60 @@ impl UtilSampler {
             last_t: Instant::now(),
             inited: false,
         }
+    }
+
+    /// Locate top-app CPU accounting. Probe order:
+    ///   1. well-known v1 layouts (`/sys/fs/cgroup/cpuacct`, `/dev/cpuctl`)
+    ///   2. well-known v2 layouts (`/sys/fs/cgroup`, `/sys/fs/cgroup/unified`)
+    ///   3. generic scan of every cgroup v1/v2 mount in /proc/mounts — OEM
+    ///      kernels routinely remount the hierarchies at non-standard paths
+    ///      (MediaTek and several ColorOS/OriginOS builds do), and the
+    ///      hardcoded lists above miss all of them.
+    ///   4. global /proc/stat (foreground load mixed with background)
+    fn probe_source() -> UtilSource {
+        for p in [
+            "/sys/fs/cgroup/cpuacct/top-app/cpuacct.usage_percpu",
+            "/dev/cpuctl/top-app/cpuacct.usage_percpu",
+        ] {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                log::info!("util: sampling top-app cgroup v1 per-cpu ({})", p.display());
+                return UtilSource::V1Percpu(p);
+            }
+        }
+        for p in [
+            "/sys/fs/cgroup/top-app/cpu.stat",
+            "/sys/fs/cgroup/unified/top-app/cpu.stat",
+        ] {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                log::info!("util: sampling top-app cgroup v2 aggregate ({})", p.display());
+                return UtilSource::V2Aggregate(p);
+            }
+        }
+
+        let (v1_mounts, v2_mounts) = cgroup_mounts();
+        for mp in &v1_mounts {
+            let p = mp.join("top-app").join("cpuacct.usage_percpu");
+            if p.exists() {
+                log::info!("util: sampling top-app cgroup v1 per-cpu ({})", p.display());
+                return UtilSource::V1Percpu(p);
+            }
+        }
+        for mp in &v2_mounts {
+            let p = mp.join("top-app").join("cpu.stat");
+            if p.exists() {
+                log::info!("util: sampling top-app cgroup v2 aggregate ({})", p.display());
+                return UtilSource::V2Aggregate(p);
+            }
+        }
+
+        log::info!(
+            "util: no top-app cgroup cpu accounting ({} v1 + {} v2 mounts scanned), falling back to /proc/stat",
+            v1_mounts.len(),
+            v2_mounts.len()
+        );
+        UtilSource::ProcStat
     }
 
     /// Per-cluster average utilisation [0,1].
@@ -424,6 +447,70 @@ impl Governor {
         for v in self.cur_limits.iter_mut() { *v = 0; }
         for t in self.last_write.iter_mut()  { *t = None; }
     }
+}
+
+/// All cgroup v1 and v2 mount points from /proc/mounts.
+/// Returns (v1 mounts, v2 mounts). v1 mounts include the per-controller
+/// ones (e.g. `/sys/fs/cgroup/cpuacct`) and combined Android mounts
+/// (e.g. `/dev/cpuctl` carrying cpu+cpuacct together).
+fn cgroup_mounts() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut v1 = Vec::new();
+    let mut v2 = Vec::new();
+    if let Ok(raw) = fs::read_to_string("/proc/mounts") {
+        for line in raw.lines() {
+            let mut f = line.split_whitespace();
+            let (_, mp, fstype) = match (f.next(), f.next(), f.next()) {
+                (Some(d), Some(m), Some(t)) => (d, m, t),
+                _ => continue,
+            };
+            match fstype {
+                "cgroup" => v1.push(PathBuf::from(unescape_mount(mp))),
+                "cgroup2" => v2.push(PathBuf::from(unescape_mount(mp))),
+                _ => {}
+            }
+        }
+    }
+    (v1, v2)
+}
+
+/// /proc/mounts octal-escapes space (\040), tab, newline and backslash.
+/// Cgroup paths virtually never contain them, but decode anyway so the
+/// join below can't be silently poisoned by an escape sequence.
+fn unescape_mount(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut oct = String::new();
+        for _ in 0..3 {
+            match it.next() {
+                Some(d) if d.is_ascii_digit() => oct.push(d),
+                other => {
+                    out.push('\\');
+                    out.push_str(&oct);
+                    if let Some(d) = other {
+                        out.push(d);
+                    }
+                    break;
+                }
+            }
+        }
+        if oct.len() == 3 {
+            if let Ok(n) = u8::from_str_radix(&oct, 8) {
+                out.push(n as char);
+            } else {
+                out.push('\\');
+                out.push_str(&oct);
+            }
+        }
+    }
+    out
 }
 
 /// Read /proc/stat and return per-cpu (idle, total) pairs.

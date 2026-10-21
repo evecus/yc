@@ -431,10 +431,14 @@ impl EbpfState {
             match event.event_type {
                 EBPF_EVENT_EXIT => {
                     applied_del(&mut self.bpf, tid);
+                    sched.forget_thread(tid as u32);
                 }
                 EBPF_EVENT_EXEC | EBPF_EVENT_RENAME => {
                     // Kernel already whitelist/tracked this thread; userspace
                     // resolves the actual rule (cmdline regex) and applies.
+                    // Refresh the comm cache first so the periodic scan sees
+                    // the new name without re-opening /proc/{tid}/comm.
+                    sched.note_comm(tid as u32, comm);
                     match sched.apply_thread(pid as u32, tid as u32, comm) {
                         Some((_, bits)) => applied_set(&mut self.bpf, tid, bits),
                         None           => applied_del(&mut self.bpf, tid),

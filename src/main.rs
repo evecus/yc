@@ -134,6 +134,11 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    if ebpf_state.is_some() {
+        // Enable the comm cache BEFORE the seed scan so the seed populates
+        // it — later scans then read comms only for unseen tids.
+        scheduler.set_ebpf_mode(true);
+    }
     if let Some(ref mut es) = ebpf_state {
         // One forced scan so APPLIED_MAP knows every currently-tracked
         // thread (their future forks then arrive as kernel events).

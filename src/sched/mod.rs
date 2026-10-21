@@ -18,7 +18,7 @@
 use std::fs;
 use std::collections::HashMap;
 use anyhow::Result;
-use nix::sched::{sched_setaffinity, CpuSet};
+use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
 use nix::unistd::Pid;
 use regex::Regex;
 use crate::config::{SchedModule, ThreadRule};
@@ -84,6 +84,12 @@ pub struct TaskScheduler {
     /// action to. Used to seed the eBPF APPLIED_MAP so that future forks
     /// of tracked threads are reported to userspace immediately.
     last_seed:      Vec<(u32, u64)>,
+    /// tid → last-seen comm. In eBPF mode the periodic scan reuses these
+    /// instead of re-opening /proc/{tid}/comm for every thread every scan
+    /// (rename events keep the cache fresh; see note_comm/forget_thread).
+    comm_cache:     HashMap<u32, String>,
+    /// True once the eBPF event path is live — enables the comm cache.
+    ebpf_active:    bool,
 }
 
 impl TaskScheduler {
@@ -116,7 +122,29 @@ impl TaskScheduler {
             pid_cache:   HashMap::new(),
             scene_dirty: false,
             last_seed:   Vec::new(),
+            comm_cache:  HashMap::new(),
+            ebpf_active: false,
         }
+    }
+
+    /// Called once the eBPF event path is live. Enables the comm cache:
+    /// the periodic scan then reuses cached comms (refreshed by rename
+    /// events) instead of re-reading /proc/{tid}/comm for every thread.
+    pub fn set_ebpf_mode(&mut self, on: bool) {
+        self.ebpf_active = on;
+        if !on { self.comm_cache.clear(); }
+    }
+
+    /// eBPF RENAME/EXEC event: refresh the cached comm for `tid`.
+    pub fn note_comm(&mut self, tid: u32, comm: &str) {
+        if self.ebpf_active {
+            self.comm_cache.insert(tid, comm.to_string());
+        }
+    }
+
+    /// eBPF EXIT event (or scan miss): drop bookkeeping for `tid`.
+    pub fn forget_thread(&mut self, tid: u32) {
+        self.comm_cache.remove(&tid);
     }
 
     pub fn set_scene(&mut self, scene: SchedScene) {
@@ -136,26 +164,41 @@ impl TaskScheduler {
 
     /// Scan core — same as scan_and_apply but returns the (tid, affinity
     /// bitmask) of every thread an action was applied to.
+    /// CPU-cost notes (this runs every 200 ms):
+    ///   • cmdline is read ONLY for pids missing from pid_cache — a full
+    ///     /proc cmdline sweep every scan costs ~600 opens and dominated
+    ///     the daemon's CPU on slow-procfs devices (measured ~19% idle).
+    ///   • in eBPF mode, thread comms come from comm_cache (kept fresh by
+    ///     rename events); comm files are opened only for unseen tids.
     fn scan_core(&mut self) -> Vec<(u32, u64)> {
         let force = self.scene_dirty;
         self.scene_dirty = false;
         self.last_seed.clear();
 
-        let procs = match list_procs() {
-            Ok(p)  => p,
-            Err(e) => { log::warn!("sched: proc scan failed: {e}"); return Vec::new(); }
-        };
+        // Enumerate pids without touching cmdline yet.
+        let mut pids: Vec<u32> = Vec::new();
+        if let Ok(rd) = fs::read_dir("/proc") {
+            for entry in rd.flatten() {
+                if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                    pids.push(pid);
+                }
+            }
+        }
 
         // Remove stale pids from cache
-        let alive: std::collections::HashSet<u32> = procs.iter().map(|(p,_)| *p).collect();
+        let alive: std::collections::HashSet<u32> = pids.iter().copied().collect();
         self.pid_cache.retain(|pid, _| alive.contains(pid));
 
-        for (pid, cmdline) in &procs {
+        let mut seen_tids: Vec<u32> = Vec::new();
+
+        for pid in &pids {
             let rule_idx = if let Some(&cached) = self.pid_cache.get(pid) {
                 cached
-            } else if let Some(ridx) = self.match_process(cmdline) {
-                self.pid_cache.insert(*pid, ridx);
-                ridx
+            } else if let Some(cmdline) = read_cmdline(*pid) {
+                match self.match_process(&cmdline) {
+                    Some(ridx) => { self.pid_cache.insert(*pid, ridx); ridx }
+                    None => continue,
+                }
             } else {
                 continue;
             };
@@ -167,7 +210,7 @@ impl TaskScheduler {
                 .unwrap_or(false);
             if !force && !pinned { continue; }
 
-            if let Ok(threads) = list_threads(*pid) {
+            if let Ok(threads) = self.list_threads_cached(*pid, &mut seen_tids) {
                 for (tid, tname) in threads {
                     let is_main = tid == *pid;
                     if let Some(action) = self.resolve_thread(rule_idx, &tname, is_main) {
@@ -180,7 +223,46 @@ impl TaskScheduler {
                 }
             }
         }
+
+        // Evict comm-cache entries for tids no longer observable. Only tids
+        // of processes scanned this round are visible; stale entries are
+        // simply re-read when their process is scanned again.
+        if self.ebpf_active {
+            self.comm_cache.retain(|tid, _| seen_tids.contains(tid));
+        }
         std::mem::take(&mut self.last_seed)
+    }
+
+    /// Threads of `pid` as (tid, comm). In eBPF mode comms are served from
+    /// comm_cache and only unseen tids hit /proc; the fallback path reads
+    /// every comm fresh. Seen tids are appended to `seen` for cache
+    /// eviction bookkeeping.
+    fn list_threads_cached(
+        &mut self,
+        pid: u32,
+        seen: &mut Vec<u32>,
+    ) -> Result<Vec<(u32, String)>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
+            if let Ok(tid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                seen.push(tid);
+                if self.ebpf_active {
+                    if let Some(c) = self.comm_cache.get(&tid) {
+                        out.push((tid, c.clone()));
+                        continue;
+                    }
+                }
+                let comm = fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if self.ebpf_active {
+                    self.comm_cache.insert(tid, comm.clone());
+                }
+                out.push((tid, comm));
+            }
+        }
+        Ok(out)
     }
 
     // ── eBPF event-path API ──────────────────────────────────────────────────
@@ -306,20 +388,45 @@ impl TaskScheduler {
 
 // ── Syscall application ───────────────────────────────────────────────────────
 
+/// Apply one thread action, skipping syscalls whose effect is already in
+/// place. The 200 ms scan re-applies pinned threads every round; without
+/// change detection that is ~750 sched syscalls per scan on a busy device.
+/// Reads (getaffinity / getpriority / getparam) are far cheaper than the
+/// writes they guard, and sched_setscheduler in particular dequeues and
+/// re-queues the task, so skipping no-op writes is a real win. It also
+/// preserves the "pinned" escape defense: a thread that dropped out of its
+/// affinity is re-pinned on the next scan because the read still mismatches.
 fn apply_action(tid: u32, action: &ThreadAction) {
     if !action.affinity_cpus.is_empty() {
         let mut set = CpuSet::new();
         for &cpu in &action.affinity_cpus {
             let _ = set.set(cpu as usize);
         }
-        if let Err(e) = sched_setaffinity(Pid::from_raw(tid as i32), &set) {
-            log::trace!("sched_setaffinity tid={tid} failed: {e}");
+        // Skip when the thread already runs on exactly this mask. A dead
+        // thread (ESRCH) also reports mismatch-free: getaffinity fails,
+        // we attempt the write once, it fails, trace-logged, done.
+        let already = sched_getaffinity(Pid::from_raw(tid as i32))
+            .map(|cur| cur == set)
+            .unwrap_or(false);
+        if !already {
+            if let Err(e) = sched_setaffinity(Pid::from_raw(tid as i32), &set) {
+                log::trace!("sched_setaffinity tid={tid} failed: {e}");
+            }
         }
     }
 
     match action.priority {
         Priority::Unchanged => {}
         Priority::Nice(n) => {
+            // getpriority returns -1 both on error and for nice == -1, and
+            // -1 is a valid nice value — so only skip the write on an
+            // unambiguous match (keeps this portable across glibc/bionic;
+            // no errno games). The ambiguous cases fall through to one
+            // harmless write.
+            let cur = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
+            if cur != -1 && cur == n {
+                return;
+            }
             let ret = unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, n) };
             if ret != 0 {
                 log::trace!("setpriority tid={tid} nice={n} failed: errno={}",
@@ -327,7 +434,18 @@ fn apply_action(tid: u32, action: &ThreadAction) {
             }
         }
         Priority::Rt(rt_prio) => {
-            // Switch to SCHED_FIFO with the given real-time priority
+            // Read-verify both the policy and the RT priority; skip the
+            // (expensive) setscheduler when the thread is already
+            // SCHED_FIFO at the wanted priority.
+            let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+            let policy = unsafe { libc::sched_getscheduler(tid as i32) };
+            let got = unsafe { libc::sched_getparam(tid as i32, &mut param) };
+            let already = policy == libc::SCHED_FIFO
+                && got == 0
+                && param.sched_priority == rt_prio as i32;
+            if already {
+                return;
+            }
             let param = libc::sched_param { sched_priority: rt_prio as i32 };
             let ret = unsafe {
                 libc::sched_setscheduler(tid as i32, libc::SCHED_FIFO, &param)
@@ -373,30 +491,153 @@ fn literal_prefix(regex: &str) -> String {
     out
 }
 
-fn list_procs() -> Result<Vec<(u32, String)>> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir("/proc")?.flatten() {
-        let name = entry.file_name();
-        let s = name.to_string_lossy();
-        if let Ok(pid) = s.parse::<u32>() {
-            if let Some(cmdline) = read_cmdline(pid) {
-                out.push((pid, cmdline));
-            }
-        }
-    }
-    Ok(out)
-}
 
-fn list_threads(pid: u32) -> Result<Vec<(u32, String)>> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
-        if let Ok(tid) = entry.file_name().to_string_lossy().parse::<u32>() {
-            let comm = fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            out.push((tid, comm));
-        }
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tests in this binary share one process, and apply_action pins the
+    /// *whole* process affinity — serialize the affinity-touching tests so
+    /// parallel execution can't interleave pins and masks.
+    static AFFINITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Scheduler whose first rule matches this test binary by name (cmdline
+    /// = path to the test harness) and pins every thread to little cores.
+    fn self_sched() -> TaskScheduler {
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_string_lossy().to_string();
+        // Double-escape: regex-escape so the name is a literal regex, then
+        // JSON-escape so the backslashes survive serde_json's parser.
+        let rx = serde_json::to_string(&regex::escape(&name)).unwrap();
+        let json = format!(r#"{{
+            "enable": true,
+            "cpumask": {{ "little": [0,1,2,3], "big": [4,5,6,7] }},
+            "affinity": {{
+                "a_little": {{"bg":"little","fg":"little","idle":"little","touch":"little","boost":"little"}},
+                "a_big":    {{"bg":"big","fg":"big","idle":"big","touch":"big","boost":"big"}}
+            }},
+            "prio": {{
+                "p_norm": {{"bg":0,"fg":0,"idle":0,"touch":0,"boost":0}},
+                "p_bg":   {{"bg":19,"fg":19,"idle":19,"touch":19,"boost":19}}
+            }},
+            "rules": [
+                {{"name":"self","regex":{},"pinned":true,
+                  "rules":[{{"k":".","ac":"a_little","pc":"p_norm"}}]}},
+                {{"name":"all","regex":".","pinned":false,
+                  "rules":[{{"k":"/MAIN_THREAD/","ac":"a_big","pc":"p_bg"}}]}}
+            ]
+        }}"#, rx);
+        TaskScheduler::new(serde_json::from_str(&json).unwrap())
     }
-    Ok(out)
+
+    /// Like self_sched, but the self-rule affinity flips with the scene:
+    /// idle → little, touch → big. Used to prove the read-check inside
+    /// apply_action does not permanently suppress legitimate re-pins.
+    fn scene_sched() -> TaskScheduler {
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_string_lossy().to_string();
+        let rx = serde_json::to_string(&regex::escape(&name)).unwrap();
+        let json = format!(r#"{{
+            "enable": true,
+            "cpumask": {{ "little": [0,1,2,3], "big": [4,5,6,7] }},
+            "affinity": {{
+                "a_flip": {{"bg":"little","fg":"little","idle":"little","touch":"big","boost":"little"}}
+            }},
+            "prio": {{
+                "p_norm": {{"bg":0,"fg":0,"idle":0,"touch":0,"boost":0}}
+            }},
+            "rules": [
+                {{"name":"self","regex":{},"pinned":true,
+                  "rules":[{{"k":".","ac":"a_flip","pc":"p_norm"}}]}}
+            ]
+        }}"#, rx);
+        TaskScheduler::new(serde_json::from_str(&json).unwrap())
+    }
+
+    fn self_mask() -> CpuSet {
+        sched_getaffinity(Pid::from_raw(0)).unwrap()
+    }
+
+    #[test]
+    fn scan_pins_self_threads_and_seeds() {
+        let _lock = AFFINITY_LOCK.lock().unwrap();
+        let mut sched = self_sched();
+        let tid = unsafe { libc::gettid() } as u32;
+
+        let seeds = sched.scan_and_apply_seeded();
+        assert!(!seeds.is_empty(), "seed scan must find this process");
+        assert!(seeds.iter().any(|(t, bits)| *t == tid && *bits == 0b1111),
+                "main thread must be seeded with the little mask, got {:?}", seeds);
+
+        let mask = self_mask();
+        for cpu in 0..4 { assert!(mask.is_set(cpu).unwrap()); }
+        for cpu in 4..8 { assert!(!mask.is_set(cpu).unwrap()); }
+    }
+
+    #[test]
+    fn second_scan_keeps_pinning_and_uses_comm_cache() {
+        let _lock = AFFINITY_LOCK.lock().unwrap();
+        let mut sched = self_sched();
+        sched.scan_and_apply_seeded();
+
+        // eBPF mode on → comm cache active; a second non-force scan must
+        // still re-pin (pinned rule) without touching /proc comm files.
+        sched.set_ebpf_mode(true);
+        sched.scan_and_apply();
+
+        let mask = self_mask();
+        for cpu in 0..4 { assert!(mask.is_set(cpu).unwrap()); }
+        assert!(!sched.comm_cache.is_empty(), "comm cache must be populated");
+        // Cached comm must be the real one for our main thread.
+        let tid = unsafe { libc::gettid() } as u32;
+        assert!(sched.comm_cache.get(&tid).is_some());
+    }
+
+    #[test]
+    fn scene_change_reapplies_with_new_mask() {
+        let _lock = AFFINITY_LOCK.lock().unwrap();
+        let mut sched = scene_sched();
+        // Default scene is Idle → "little" mask.
+        sched.scan_and_apply_seeded();
+        let mask = self_mask();
+        for cpu in 0..4 { assert!(mask.is_set(cpu).unwrap()); }
+        for cpu in 4..8 { assert!(!mask.is_set(cpu).unwrap()); }
+
+        // Scene switch Idle→Touch flips the resolved mask to "big".
+        // The read-check inside apply_action must NOT suppress this write:
+        // current mask (little) differs from the target (big), so the
+        // scheduler must re-pin — proving change detection doesn't
+        // permanently freeze legitimate updates.
+        sched.set_scene(SchedScene::Touch);
+        sched.scan_and_apply();
+        let mask = self_mask();
+        for cpu in 4..8 { assert!(mask.is_set(cpu).unwrap()); }
+        for cpu in 0..4 { assert!(!mask.is_set(cpu).unwrap()); }
+    }
+
+    #[test]
+    fn note_and_forget_comm() {
+        let mut sched = self_sched();
+        sched.set_ebpf_mode(true);
+        let tid = unsafe { libc::gettid() } as u32;
+
+        sched.note_comm(tid, "SelftestWorker");
+        assert_eq!(sched.comm_cache.get(&tid).map(|s| s.as_str()), Some("SelftestWorker"));
+
+        sched.forget_thread(tid);
+        assert!(sched.comm_cache.get(&tid).is_none());
+    }
+
+    #[test]
+    fn whitelist_prefixes_from_regexes() {
+        let sched = self_sched();
+        let p = sched.whitelist_prefixes();
+        // Rule 1 is an escaped absolute path → long literal prefix; rule 2
+        // is "." → no prefix. Both must be handled.
+        assert!(p.iter().any(|s| s.contains("deps") || s.len() > 3));
+        assert!(!p.iter().any(|s| s.is_empty()));
+    }
 }
