@@ -16,7 +16,8 @@
 //   Idle → idle, Touch/Trigger/Gesture/Junk → touch, Switch → boost
 
 use std::fs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use anyhow::Result;
 use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
 use nix::unistd::Pid;
@@ -34,6 +35,18 @@ pub enum SchedScene {
     Touch,
     Boost,
 }
+
+// ── Scan pacing ──────────────────────────────────────────────────────────────
+
+/// Scan period while the scene is active (touch/boost) or a scene change is
+/// pending — this is where pinned-thread "escape" re-pinning matters.
+const ACTIVE_SCAN_INTERVAL: Duration = Duration::from_millis(200);
+/// Scan period while the device sits in the Idle scene. Nothing is moving, so
+/// re-checking ~500 pinned threads at 5 Hz only burns CPU.
+const IDLE_SCAN_INTERVAL: Duration = Duration::from_millis(1000);
+/// How long a pid with an empty / unmatched cmdline (kernel threads, zombies)
+/// stays in the negative cache before it is probed again.
+const NEG_CACHE_TTL: Duration = Duration::from_secs(5);
 
 // ── Priority encoding ────────────────────────────────────────────────────────
 //
@@ -90,6 +103,10 @@ pub struct TaskScheduler {
     comm_cache:     HashMap<u32, String>,
     /// True once the eBPF event path is live — enables the comm cache.
     ebpf_active:    bool,
+    /// pid → time it was found unmatchable (empty cmdline = kernel thread /
+    /// zombie, or no process rule matched). Without this every scan re-opens
+    /// /proc/<pid>/cmdline for every kernel thread (hundreds of pids).
+    neg_cache:      HashMap<u32, Instant>,
 }
 
 impl TaskScheduler {
@@ -124,7 +141,19 @@ impl TaskScheduler {
             last_seed:   Vec::new(),
             comm_cache:  HashMap::new(),
             ebpf_active: false,
+            neg_cache:   HashMap::new(),
         }
+    }
+
+    /// Whether the periodic scan should run now. Idle scene with nothing
+    /// pending scans at 1 Hz; anything else keeps the 200 ms cadence.
+    pub fn scan_due(&self, since_last: Duration) -> bool {
+        let interval = if self.scene_dirty || self.scene != SchedScene::Idle {
+            ACTIVE_SCAN_INTERVAL
+        } else {
+            IDLE_SCAN_INTERVAL
+        };
+        since_last >= interval
     }
 
     /// Called once the eBPF event path is live. Enables the comm cache:
@@ -185,21 +214,29 @@ impl TaskScheduler {
             }
         }
 
-        // Remove stale pids from cache
-        let alive: std::collections::HashSet<u32> = pids.iter().copied().collect();
+        // Remove stale pids from the caches
+        let alive: HashSet<u32> = pids.iter().copied().collect();
         self.pid_cache.retain(|pid, _| alive.contains(pid));
+        let now = Instant::now();
+        self.neg_cache.retain(|pid, t| {
+            alive.contains(pid) && now.duration_since(*t) < NEG_CACHE_TTL
+        });
 
-        let mut seen_tids: Vec<u32> = Vec::new();
+        let mut seen_tids: HashSet<u32> = HashSet::new();
 
         for pid in &pids {
             let rule_idx = if let Some(&cached) = self.pid_cache.get(pid) {
                 cached
+            } else if self.neg_cache.contains_key(pid) {
+                continue;
             } else if let Some(cmdline) = read_cmdline(*pid) {
                 match self.match_process(&cmdline) {
                     Some(ridx) => { self.pid_cache.insert(*pid, ridx); ridx }
-                    None => continue,
+                    None => { self.neg_cache.insert(*pid, now); continue; }
                 }
             } else {
+                // Empty cmdline: kernel thread / zombie. Remember it.
+                self.neg_cache.insert(*pid, now);
                 continue;
             };
 
@@ -240,12 +277,12 @@ impl TaskScheduler {
     fn list_threads_cached(
         &mut self,
         pid: u32,
-        seen: &mut Vec<u32>,
+        seen: &mut HashSet<u32>,
     ) -> Result<Vec<(u32, String)>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
             if let Ok(tid) = entry.file_name().to_string_lossy().parse::<u32>() {
-                seen.push(tid);
+                seen.insert(tid);
                 if self.ebpf_active {
                     if let Some(c) = self.comm_cache.get(&tid) {
                         out.push((tid, c.clone()));
@@ -291,6 +328,7 @@ impl TaskScheduler {
         let cmdline = read_cmdline(pid)?;
         let rule_idx = self.match_process(&cmdline)?;
         self.pid_cache.insert(pid, rule_idx);
+        self.neg_cache.remove(&pid);
         let action = self.resolve_thread(rule_idx, tname, tid == pid)?;
         let bits = action.affinity_cpus.iter()
             .filter(|&&c| c < 64)
@@ -616,6 +654,41 @@ mod tests {
         let mask = self_mask();
         for cpu in 4..8 { assert!(mask.is_set(cpu).unwrap()); }
         for cpu in 0..4 { assert!(!mask.is_set(cpu).unwrap()); }
+    }
+
+    #[test]
+    fn unmatched_pids_land_in_negative_cache() {
+        // A scheduler whose only rule matches nothing negative-caches every
+        // visible pid after one scan, and keeps them for the next one.
+        let mut none = TaskScheduler::new(serde_json::from_str(r#"{
+            "enable": true, "cpumask": {}, "affinity": {}, "prio": {},
+            "rules": [{"name":"x","regex":"^__never_matches__$",
+                         "pinned":false,"rules":[]}]
+        }"#).unwrap());
+        none.scan_and_apply();
+        let n1 = none.neg_cache.len();
+        assert!(n1 > 0, "visible pids must be negative-cached");
+        assert!(none.pid_cache.is_empty());
+        none.scan_and_apply();
+        assert!(none.neg_cache.len() >= n1.saturating_sub(5));
+    }
+
+    #[test]
+    fn idle_scene_scans_slower_than_active() {
+        let mut sched = self_sched();
+        // Idle, clean: 1 s cadence.
+        assert!(!sched.scan_due(Duration::from_millis(300)));
+        assert!(sched.scan_due(Duration::from_millis(1000)));
+        // Pending scene change: back to the 200 ms cadence.
+        sched.set_scene(SchedScene::Touch);
+        assert!(sched.scan_due(Duration::from_millis(200)));
+        assert!(!sched.scan_due(Duration::from_millis(100)));
+        // Active scene stays on 200 ms even after the dirty flag is consumed.
+        sched.scene_dirty = false;
+        assert!(sched.scan_due(Duration::from_millis(200)));
+        // Back to Idle → dirty again (must re-apply idle masks promptly).
+        sched.set_scene(SchedScene::Idle);
+        assert!(sched.scan_due(Duration::from_millis(200)));
     }
 
     #[test]
