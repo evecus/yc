@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::os::unix::io::AsRawFd;
+use std::time::{Duration, Instant};
 use inotify::{Inotify, WatchMask};
 use anyhow::{Result, Context};
 
@@ -16,6 +17,18 @@ pub enum WatchEvent {
     ModeChange(String),
 }
 
+/// Minimum spacing between two `/sys/power/wake_lock` reads (ms).
+/// wake_lock is one of the chattiest files on Android — every kernel
+/// wakelock acquire/release touches it — and its show() walks the whole
+/// lock list. Re-reading it per inotify event was a measurable idle-CPU
+/// cost; 4 Hz is plenty for screen-state tracking (the main loop also
+/// keeps a 500 ms top-app-empty fallback).
+const WAKE_RECHECK_MS: u64 = 250;
+/// Minimum spacing between two AppSwitch emissions (ms). Foreground
+/// thread churn rewrites cgroup.procs constantly; switches closer than
+/// this are meaningless to the FSM.
+const APPSWITCH_MIN_INTERVAL_MS: u64 = 150;
+
 pub struct Watcher {
     inotify:       Inotify,
     wd_cpuset:     Option<inotify::WatchDescriptor>,
@@ -23,6 +36,8 @@ pub struct Watcher {
     wd_switchfile: Option<inotify::WatchDescriptor>,
     switch_path:   String,
     screen_on:     bool,
+    last_wake_check: Option<Instant>,
+    last_app_switch: Option<Instant>,
 }
 
 impl Watcher {
@@ -54,6 +69,8 @@ impl Watcher {
             wd_switchfile,
             switch_path: switch_inode.to_string(),
             screen_on: true,
+            last_wake_check: None,
+            last_app_switch: None,
         })
     }
 
@@ -70,8 +87,24 @@ impl Watcher {
             Ok(events) => {
                 for event in events {
                     if self.wd_cpuset.as_ref().map(|w| *w == event.wd).unwrap_or(false) {
-                        out.push(WatchEvent::AppSwitch);
+                        // Coalesce foreground-thread churn: cgroup.procs is
+                        // rewritten on every thread attach/detach of the
+                        // foreground app, but the FSM only cares about the
+                        // latest switch.
+                        let due = self.last_app_switch
+                            .map(|t| t.elapsed() >= Duration::from_millis(APPSWITCH_MIN_INTERVAL_MS))
+                            .unwrap_or(true);
+                        if due {
+                            self.last_app_switch = Some(Instant::now());
+                            out.push(WatchEvent::AppSwitch);
+                        }
                     } else if self.wd_wakelock.as_ref().map(|w| *w == event.wd).unwrap_or(false) {
+                        // Rate-limit the sysfs read itself (see WAKE_RECHECK_MS).
+                        let due = self.last_wake_check
+                            .map(|t| t.elapsed() >= Duration::from_millis(WAKE_RECHECK_MS))
+                            .unwrap_or(true);
+                        if !due { continue; }
+                        self.last_wake_check = Some(Instant::now());
                         let new_on = is_screen_on();
                         if new_on != self.screen_on {
                             self.screen_on = new_on;

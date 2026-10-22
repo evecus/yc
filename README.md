@@ -18,6 +18,8 @@ config format.
 | util sampling | Foreground cgroup accounting instead of global `/proc/stat` (well-known v1/v2 paths, then a generic scan of every cgroup mount in `/proc/mounts` for OEM-remounted hierarchies, then `/proc/stat` fallback) |
 | Frequency control | Segmented power model (free/sweet/plain/turbo) + write hysteresis |
 | Scheduler overhead | Lazy cmdline reads (pid-cache hits skip /proc), read-before-write action application (affinity/nice/RT skipped when already in the target state), and an eBPF-mode comm cache fed by rename/exit events — the 200 ms fallback poll no longer costs ~20% of a core on MTK procfs |
+| Watcher overhead | Rate-limited `/sys/power/wake_lock` re-reads (≤4/s) and coalesced AppSwitch events (≤7/s) — the file is one of the chattiest on Android and used to be re-read per inotify event |
+| Observability | Every 5 s a `perf:` line with per-thread CPU of the daemon plus scan/governor/ebpf-event/loop-rate breakdown, so idle-CPU regressions are attributable without strace |
 
 ## eBPF mode (optional)
 

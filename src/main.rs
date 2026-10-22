@@ -25,6 +25,7 @@ mod platform;
 mod ebpf;
 
 use std::collections::HashMap;
+use std::fs;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
@@ -61,9 +62,22 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let log_level = std::env::var("UPERF_LOG").unwrap_or_else(|_| "info".into());
-    env_logger::Builder::from_env(
+    let mut log_builder = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(&log_level)
-    ).init();
+    );
+    if let Some(path) = &cli.output {
+        // Append, never truncate — the daemon is restarted by service.sh
+        // across reboots and the history matters.
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(f) => {
+                log_builder.target(env_logger::Target::Pipe(Box::new(f)));
+            }
+            Err(e) => eprintln!(
+                "uperf: cannot open log file {path} ({e}) — logging to stderr"
+            ),
+        }
+    }
+    log_builder.init();
 
     log::info!("uperf starting — config: {}", cli.config);
 
@@ -186,6 +200,20 @@ fn main() -> Result<()> {
     let mut events = [epoll_event { events: 0, u64: 0 }; 32];
     let mut last_sched_scan = Instant::now();
 
+    // Self-profiling state — every 5 s one `perf:` log line with per-thread
+    // CPU of this process plus the cost breakdown of the hot paths. This is
+    // the ground truth for idle-CPU investigations (a 15 % static draw can
+    // otherwise only be guessed at).
+    let mut perf_window_start = Instant::now();
+    let mut perf_threads: HashMap<u32, u64> = HashMap::new();
+    let mut perf_scan_n = 0u64;
+    let mut perf_scan_ns: u128 = 0;
+    let mut perf_scan_max_ns: u128 = 0;
+    let mut perf_gov_n = 0u64;
+    let mut perf_gov_ns: u128 = 0;
+    let mut perf_gov_max_ns: u128 = 0;
+    let mut perf_ev_last: u64 = 0;
+
     // Screen-state fallback (wake_lock string matching is unreliable on
     // some devices): top-app cgroup going empty for 5s ⇒ screen off.
     let mut last_screen_check = Instant::now();
@@ -197,7 +225,11 @@ fn main() -> Result<()> {
     let mut last_pkg = String::new();
     let mut perapp_override = false;
 
+    let mut perf_ev_last: u64 = 0;
+    let mut perf_loops: u64 = 0;
+
     loop {
+        perf_loops += 1;
         // ── eBPF process events (non-blocking drain) ──
         if let Some(ref mut es) = ebpf_state {
             es.drain(&mut scheduler);
@@ -323,10 +355,63 @@ fn main() -> Result<()> {
             if fd == timer_fd {
                 let mut buf = [0u8; 8];
                 let _ = unsafe { libc::read(timer_fd, buf.as_mut_ptr() as _, 8) };
+                let t0 = Instant::now();
                 governor.apply(&mut sysfs, screen_off_active);
+                let gov_ns = t0.elapsed().as_nanos();
+                perf_gov_n += 1;
+                perf_gov_ns += gov_ns;
+                if gov_ns > perf_gov_max_ns { perf_gov_max_ns = gov_ns; }
                 if last_sched_scan.elapsed() >= Duration::from_millis(200) {
+                    let t1 = Instant::now();
                     scheduler.scan_and_apply();
+                    let scan_ns = t1.elapsed().as_nanos();
+                    perf_scan_n += 1;
+                    perf_scan_ns += scan_ns;
+                    if scan_ns > perf_scan_max_ns { perf_scan_max_ns = scan_ns; }
                     last_sched_scan = Instant::now();
+                }
+
+                // ── periodic self-profile (every 5 s) ──
+                if perf_window_start.elapsed() >= Duration::from_secs(5) {
+                    let window = perf_window_start.elapsed().as_secs_f64().max(0.001);
+                    perf_window_start = Instant::now();
+
+                    // Per-thread CPU of this process from /proc jiffies.
+                    let mut delta_total = 0u64;
+                    let mut parts: Vec<String> = Vec::new();
+                    for (tid, comm, jiffies) in thread_cpu_jiffies() {
+                        let prev = perf_threads.insert(tid, jiffies).unwrap_or(jiffies);
+                        let d = jiffies.saturating_sub(prev);
+                        if d == 0 { continue; }
+                        delta_total += d;
+                        // USER_HZ = 100 on Android/bionic → 100 jiffies = 1 core-second.
+                        let pct = d as f64 / (window * 100.0);
+                        if pct >= 0.3 {
+                            parts.push(format!("{comm}:{tid} {pct:.1}%"));
+                        }
+                    }
+
+                    let ev_now = ebpf_state.as_ref().map(|e| e.events).unwrap_or(0);
+                    let ev_rate = ev_now.saturating_sub(perf_ev_last) as f64 / window;
+                    perf_ev_last = ev_now;
+
+                    log::info!(
+                        "perf: {:.1}% total [{}] | scan avg {:.2}ms max {:.2}ms n={} | \
+                         gov avg {:.2}ms max {:.2}ms n={} | ebpf {:.0} ev/s | loop {:.0}/s",
+                        delta_total as f64 / (window * 100.0),
+                        if parts.is_empty() { "idle".to_string() } else { parts.join(", ") },
+                        perf_scan_ns as f64 / perf_scan_n.max(1) as f64 / 1e6,
+                        perf_scan_max_ns as f64 / 1e6,
+                        perf_scan_n,
+                        perf_gov_ns as f64 / perf_gov_n.max(1) as f64 / 1e6,
+                        perf_gov_max_ns as f64 / 1e6,
+                        perf_gov_n,
+                        ev_rate,
+                        perf_loops as f64 / window,
+                    );
+                    perf_scan_n = 0; perf_scan_ns = 0; perf_scan_max_ns = 0;
+                    perf_gov_n = 0; perf_gov_ns = 0; perf_gov_max_ns = 0;
+                    perf_loops = 0;
                 }
                 continue;
             }
@@ -349,6 +434,27 @@ fn main() -> Result<()> {
 }
 
 // ── Hint change ──────────────────────────────────────────────────────────────
+
+/// (tid, comm, utime+stime in jiffies) for every thread of this process.
+/// Used by the 5 s self-profile line. /proc/[pid]/stat fields after the
+/// comm (which may itself contain spaces/parens — split after the last
+/// ')'): state=3 … utime=14, stime=15, i.e. offsets 11 and 12 past the
+/// closing paren.
+fn thread_cpu_jiffies() -> Vec<(u32, String, u64)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir("/proc/self/task") {
+        for entry in rd.flatten() {
+            let Ok(tid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+            let Ok(raw) = fs::read_to_string(format!("/proc/self/task/{tid}/stat")) else { continue };
+            let Some((comm, rest)) = raw.rsplit_once(')') else { continue };
+            let comm = comm.rsplit('(').next().unwrap_or("").to_string();
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            let jiff = |i: usize| f.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            out.push((tid, comm, jiff(11) + jiff(12)));
+        }
+    }
+    out
+}
 
 fn on_hint_change(
     sysfs:     &mut SysfsWriter,
@@ -460,4 +566,25 @@ fn read_mode_file(path: &str) -> String {
         .next()
         .unwrap_or("balance")
         .to_lowercase()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_cpu_jiffies_parses_real_proc() {
+        let threads = thread_cpu_jiffies();
+        assert!(threads.len() >= 1, "must at least see the calling thread");
+        let pid = unsafe { libc::getpid() } as u32;
+        assert!(threads.iter().any(|(tid, _, _)| *tid == pid),
+                "main thread tid={pid} must be listed, got {:?}", threads);
+        // Cumulative jiffies of a short-lived test process stay tiny; a
+        // parsing bug (wrong field offset) would show up as 0 or absurd.
+        for (_, _, j) in &threads {
+            assert!(*j < 100_000, "implausible jiffies {j}");
+        }
+    }
 }
